@@ -28,8 +28,9 @@ from .delivery_window import DeliveryWindow, get_zone
 # and stamped at LATEST_USER_VERSION in one transaction.
 #
 # Steps are idempotent and guarded by the state they expect (column/table
-# presence), which lets the chain run against version-0 databases created by
-# any older release regardless of how far that release had drifted.
+# presence and, for v7, the CHECK constraint's actual behavior), which lets
+# the chain run against version-0 databases created by any older release
+# regardless of how far that release had drifted.
 # Concurrent first starts are serialized by the BEGIN IMMEDIATE write lock;
 # the instance that reaches a step second re-reads user_version inside its
 # own write transaction and skips every step an earlier instance already
@@ -198,6 +199,18 @@ CREATE TABLE IF NOT EXISTS attempts (
 # table-rebuild procedure it runs with foreign_keys=OFF, inside one explicit
 # transaction; the rebuilt table already carries deliver_at, which the next
 # version adds with a guarded ALTER for databases that skip the rebuild.
+#
+# The column list below is the v7 target shape; _migrate_v7() decides whether a
+# rebuild is actually needed and performs the data movement with a column list
+# derived from the *source* table (so a drifting release that already added
+# cancelled_at or deliver_at never has that data silently overwritten with
+# NULL).
+_TASKS_REBUILD_COLUMNS = (
+    "id", "event_id", "subscription_id", "status", "attempts", "max_attempts",
+    "deliver_at", "next_attempt_at", "claimed_by", "last_status_code",
+    "last_error", "result", "created_at", "updated_at", "cancelled_at",
+)
+
 _TASKS_TABLE_REBUILD = (
     """
 CREATE TABLE tasks_new (
@@ -221,16 +234,6 @@ CREATE TABLE tasks_new (
     cancelled_at     REAL,
     UNIQUE (event_id, subscription_id)
 )
-""",
-    """
-INSERT INTO tasks_new
-    (id, event_id, subscription_id, status, attempts, max_attempts,
-     deliver_at, next_attempt_at, claimed_by, last_status_code, last_error,
-     result, created_at, updated_at, cancelled_at)
-SELECT id, event_id, subscription_id, status, attempts, max_attempts,
-       NULL, next_attempt_at, claimed_by, last_status_code, last_error,
-       result, created_at, updated_at, NULL
-FROM tasks
 """,
     "DROP TABLE tasks",
     "ALTER TABLE tasks_new RENAME TO tasks",
@@ -280,6 +283,110 @@ def _has_table(conn, name: str) -> bool:
     return row is not None
 
 
+def _tasks_status_check_accepts(conn, status: str) -> bool:
+    """Whether tasks' status CHECK constraint admits ``status``.
+
+    Column presence is no proof of constraint capability: a version-0 release
+    could ALTER in cancelled_at while the status CHECK still lists only the
+    original four states (and PRAGMA table_info cannot see CHECK clauses at
+    all). Probe the *actual enforced constraint* instead: insert a probe row
+    inside a SAVEPOINT and roll it straight back. A rejected probe means the
+    CHECK forbids the value; an accepted probe means it allows it. Nothing is
+    persisted -- the rolled-back savepoint also undoes the row's AUTOINCREMENT
+    bookkeeping in sqlite_sequence.
+
+    Runs with foreign_keys=OFF (the v7 step's setting), so a dangling
+    event_id on the probe row never raises a foreign-key error; only the
+    status CHECK (or NOT NULL on a badly drifted table) can reject it.
+    """
+    try:
+        conn.execute("SAVEPOINT tasks_check_probe")
+        try:
+            conn.execute(
+                "INSERT INTO tasks (event_id, subscription_id, status, "
+                "max_attempts, created_at, updated_at) "
+                "VALUES ('__migration_probe__', '__migration_probe__', ?, 0, 0, 0)",
+                (status,),
+            )
+        finally:
+            conn.execute("ROLLBACK TO SAVEPOINT tasks_check_probe")
+            conn.execute("RELEASE SAVEPOINT tasks_check_probe")
+    except sqlite3.IntegrityError:
+        return False
+    return True
+
+
+def _tasks_supports_cancellation(conn) -> bool:
+    """Whether the current tasks table enforces the v7 cancellation contract.
+
+    True exactly when cancelled_at exists, the status CHECK accepts the new
+    terminal value 'cancelled', *and* a value outside the enum is still
+    rejected -- the last clause distinguishes a real CHECK from a drifted
+    table that carries the column with no (or an over-permissive) constraint.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    return (
+        "cancelled_at" in cols
+        and _tasks_status_check_accepts(conn, "cancelled")
+        and not _tasks_status_check_accepts(conn, "__not_a_status__")
+    )
+
+
+def _rebuild_tasks_table(conn) -> None:
+    """Atomically replace tasks with the widened v7 shape, losing nothing.
+
+    Following the SQLite table-rebuild procedure (foreign_keys=OFF is set by
+    the caller, outside the transaction):
+
+    - every row is copied with explicit ids, preserving primary keys;
+    - the INSERT column list is derived from the *source* table, so columns a
+      drifting release already added (cancelled_at, deliver_at) keep their
+      values instead of being reset to NULL;
+    - the AUTOINCREMENT sequence is carried over explicitly (recent SQLite
+      builds rename sqlite_sequence automatically; doing it ourselves is
+      harmless there and required on older builds), so a post-rebuild insert
+      never reuses an old task id;
+    - the FOREIGN KEY declaration and both indexes are recreated verbatim.
+    """
+    # Read source shape and the AUTOINCREMENT high-water mark before dropping.
+    source_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(tasks)")
+    }
+    target_cols = list(_TASKS_REBUILD_COLUMNS)
+    # Snapshot sqlite_sequence: its row exists only once AUTOINCREMENT has
+    # issued an id, and it disappears when the table is dropped.
+    seq_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+    ).fetchone()
+    auto_seq = seq_row[0] if seq_row is not None else None
+
+    conn.execute(_TASKS_TABLE_REBUILD[0])  # CREATE TABLE tasks_new
+
+    # Copy column-by-column: a value present in the source travels through;
+    # a column the drifting table never had arrives as NULL. Explicit id
+    # insertion preserves every primary key.
+    copied = ", ".join(
+        f'"{col}"' if col in source_cols else "NULL" for col in target_cols
+    )
+    col_list = ", ".join(f'"{col}"' for col in target_cols)
+    conn.execute(
+        f"INSERT INTO tasks_new ({col_list}) SELECT {copied} FROM tasks"
+    )
+
+    for stmt in _TASKS_TABLE_REBUILD[1:]:  # DROP / RENAME / recreate indexes
+        conn.execute(stmt)
+
+    # Restore the AUTOINCREMENT high-water mark under the table's new name:
+    # delete whatever the copy/rename left, then re-install the captured value
+    # only when the old table had a sequence row at all.
+    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('tasks', 'tasks_new')")
+    if auto_seq is not None:
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('tasks', ?)",
+            (auto_seq,),
+        )
+
+
 def _migrate_v1(conn) -> None:
     for stmt in _V1_BOOTSTRAP_STATEMENTS:
         conn.execute(stmt)
@@ -327,13 +434,20 @@ def _migrate_v6(conn) -> None:
 
 
 def _migrate_v7(conn) -> None:
-    # Rebuild only when the widened 'cancelled' CHECK / cancelled_at column
-    # is absent. A version-0 database created by a release that already had
-    # cancellation skips the rebuild; v8 then just adds deliver_at.
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
-    if "cancelled_at" not in cols:
-        for stmt in _TASKS_TABLE_REBUILD:
-            conn.execute(stmt)
+    # A rebuild is needed unless the *table as enforced* already provides the
+    # cancellation capability: the cancelled_at column present AND the status
+    # CHECK actually accepting 'cancelled' (while still rejecting non-enum
+    # values). Column presence alone is not enough -- a half-finished
+    # version-0 database may carry cancelled_at (added by ALTER) while its
+    # CHECK still forbids 'cancelled'; trusting the column would skip the
+    # rebuild and make cancel_event fail at runtime with a CHECK violation.
+    # The CHECK behavior is verified by savepoint probes, not by parsing
+    # sqlite_master text.
+    if _tasks_supports_cancellation(conn):
+        # Already cancellation-capable (a previous release's v0 file); v8's
+        # guarded ALTER adds deliver_at if that column is still missing.
+        return
+    _rebuild_tasks_table(conn)
 
 
 def _migrate_v8(conn) -> None:
