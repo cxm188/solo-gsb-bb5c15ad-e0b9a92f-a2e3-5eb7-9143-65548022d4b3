@@ -7,6 +7,11 @@ Covers the requirements of the refactored SQLite startup migration:
   keeps every row, index value and constraint behavior;
 - a version-0 database already carrying the final schema (last-release file)
   runs idempotently through the guarded steps;
+- a half-completed version-0 database -- cancelled_at column present but the
+  status CHECK still rejecting 'cancelled' -- is detected by the version-7
+  constraint-capability probe and repaired with an atomic tasks rebuild that
+  keeps rows, ids, the autoincrement high-water mark, foreign keys and
+  indexes, so POST /events/{id}/cancel works after the upgrade;
 - each step's DDL and its user_version bump commit together: an injected
   step failure rolls the step back, leaves the previous whole version in
   place, and the chain resumes after the "repair" on the next start;
@@ -78,6 +83,89 @@ def _create_v1_database(path: str) -> None:
                   started_at, finished_at)
                VALUES (1, 1, 500, 'boom', 102.0, 103.0)"""
         )
+        conn.execute("PRAGMA user_version=0")
+    finally:
+        conn.close()
+
+
+def _create_drifted_cancel_database(path: str) -> None:
+    """Create the half-completed drift point: user_version 0, tasks already
+    carries the cancelled_at column, but its status CHECK still rejects
+    'cancelled' (an interrupted repair added the column without the version-7
+    table rebuild). Column presence alone must not skip the rebuild."""
+    conn = _raw_connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE subscriptions (id TEXT PRIMARY KEY, target_url TEXT "
+            "NOT NULL, secret TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE events (id TEXT PRIMARY KEY, payload TEXT NOT NULL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            """CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id TEXT NOT NULL REFERENCES events(id),
+                 subscription_id TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','in_progress','delivered',
+                                     'failed')),
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 max_attempts INTEGER NOT NULL,
+                 next_attempt_at REAL, claimed_by TEXT,
+                 last_status_code INTEGER, last_error TEXT,
+                 result TEXT CHECK (result IN ('delivered','failed')),
+                 created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                 cancelled_at REAL,
+                 UNIQUE (event_id, subscription_id))"""
+        )
+        conn.execute(
+            "CREATE TABLE attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "task_id INTEGER NOT NULL REFERENCES tasks(id), attempt_no INTEGER "
+            "NOT NULL, status_code INTEGER, error TEXT, started_at REAL NOT NULL, "
+            "finished_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO subscriptions (id, target_url, secret, created_at) "
+            "VALUES ('sub-dddd0004', 'http://example/hook', 'k', 100.0)"
+        )
+        conn.execute(
+            "INSERT INTO events (id, payload, created_at) "
+            "VALUES ('evt-pending', '{}', 101.0)"
+        )
+        conn.execute(
+            "INSERT INTO events (id, payload, created_at) "
+            "VALUES ('evt-finished', '{}', 102.0)"
+        )
+        # id 1: still pending -> cancellable once the CHECK is repaired.
+        conn.execute(
+            "INSERT INTO tasks (event_id, subscription_id, status, attempts, "
+            "max_attempts, next_attempt_at, created_at, updated_at) VALUES "
+            "('evt-pending', 'sub-dddd0004', 'pending', 0, 4, 103.0, 103.0, 103.0)"
+        )
+        # id 2: finished, and carries drift data in cancelled_at that the
+        # rebuild must preserve verbatim (not reset to NULL).
+        conn.execute(
+            "INSERT INTO tasks (event_id, subscription_id, status, attempts, "
+            "max_attempts, next_attempt_at, claimed_by, last_status_code, "
+            "last_error, result, created_at, updated_at, cancelled_at) VALUES "
+            "('evt-finished', 'sub-dddd0004', 'failed', 4, 4, NULL, 'w1', 500, "
+            "'boom', 'failed', 104.0, 109.0, 555.0)"
+        )
+        conn.execute(
+            "INSERT INTO attempts (task_id, attempt_no, status_code, error, "
+            "started_at, finished_at) VALUES (2, 1, 500, 'boom', 104.0, 105.0)"
+        )
+        # id 3 is inserted and deleted, leaving the autoincrement high-water
+        # mark (3) above the highest live id (2); the rebuild must not let a
+        # future task reuse it.
+        conn.execute(
+            "INSERT INTO tasks (event_id, subscription_id, status, attempts, "
+            "max_attempts, created_at, updated_at) VALUES "
+            "('evt-finished', 'sub-other', 'failed', 4, 4, 106.0, 106.0)"
+        )
+        conn.execute("DELETE FROM tasks WHERE id = 3")
         conn.execute("PRAGMA user_version=0")
     finally:
         conn.close()
@@ -339,6 +427,195 @@ class MigrationTests(unittest.TestCase):
         finally:
             database.close()
 
+    def test_version0_with_column_but_old_check_is_rebuilt(self) -> None:
+        # Drift point: an interrupted repair added cancelled_at but never
+        # ran the version-7 rebuild, so the status CHECK still rejects
+        # 'cancelled'. Column presence alone must not skip the rebuild.
+        _create_drifted_cancel_database(self.path)
+        database = Database(self.path)
+        try:
+            conn = database._conn
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                LATEST_USER_VERSION,
+            )
+            # Rows, primary keys and drift data in the later-added columns
+            # survive the rebuild verbatim.
+            rows = conn.execute(
+                "SELECT id, status, attempts, result, cancelled_at, deliver_at "
+                "FROM tasks ORDER BY id"
+            ).fetchall()
+            self.assertEqual(
+                [tuple(r) for r in rows],
+                [
+                    (1, "pending", 0, None, None, None),
+                    (2, "failed", 4, "failed", 555.0, None),
+                ],
+            )
+            # Attempt history (and its FK into tasks) is intact; startup's
+            # foreign_key_check passed, so the rebuilt table satisfies it.
+            self.assertEqual(
+                tuple(
+                    conn.execute(
+                        "SELECT task_id, attempt_no FROM attempts"
+                    ).fetchone()
+                ),
+                (2, 1),
+            )
+            # The rebuilt CHECK now accepts the 'cancelled' terminal state:
+            # cancelling the event flips its pending task.
+            result = database.cancel_event("evt-pending")
+            self.assertEqual(result["cancelled"], 1)
+            self.assertEqual(
+                result["counts"],
+                {
+                    "pending": 0,
+                    "in_progress": 0,
+                    "delivered": 0,
+                    "failed": 0,
+                    "cancelled": 1,
+                },
+            )
+            # The recreated indexes are present.
+            self.assertEqual(
+                [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index' "
+                        "AND tbl_name='tasks' AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name"
+                    )
+                ],
+                ["idx_tasks_due", "idx_tasks_sub_order"],
+            )
+            # The autoincrement high-water mark survived the rebuild: the
+            # deleted id 3 is never reused by a future task.
+            self.assertEqual(
+                conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+                ).fetchone()[0],
+                3,
+            )
+            database.create_event("evt-new", "{}")
+            task, created = database.create_task(
+                "evt-new", "sub-dddd0004", max_attempts=4
+            )
+            self.assertTrue(created)
+            self.assertEqual(task["id"], 4)
+        finally:
+            database.close()
+
+        # A repeated start is a no-op and keeps the repaired state.
+        reopened = Database(self.path)
+        try:
+            self.assertEqual(
+                reopened._conn.execute("PRAGMA user_version").fetchone()[0],
+                LATEST_USER_VERSION,
+            )
+            self.assertEqual(
+                reopened._conn.execute(
+                    "SELECT status FROM tasks WHERE id = 1"
+                ).fetchone()[0],
+                "cancelled",
+            )
+        finally:
+            reopened.close()
+
+    def test_failed_tasks_rebuild_rolls_back_without_advancing_version(self) -> None:
+        # Same drift point, but the table also lost its UNIQUE constraint
+        # and holds duplicate (event_id, subscription_id) rows, so the
+        # rebuild's INSERT into the constrained tasks_new must fail: the
+        # whole step rolls back and user_version is not advanced past the
+        # last whole version.
+        conn = _raw_connect(self.path)
+        try:
+            conn.execute(
+                "CREATE TABLE subscriptions (id TEXT PRIMARY KEY, target_url "
+                "TEXT NOT NULL, secret TEXT NOT NULL, created_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE events (id TEXT PRIMARY KEY, payload TEXT NOT NULL, "
+                "created_at REAL NOT NULL)"
+            )
+            conn.execute(
+                """CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id TEXT NOT NULL REFERENCES events(id),
+                     subscription_id TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','in_progress','delivered',
+                                         'failed')),
+                     attempts INTEGER NOT NULL DEFAULT 0,
+                     max_attempts INTEGER NOT NULL,
+                     next_attempt_at REAL, claimed_by TEXT,
+                     last_status_code INTEGER, last_error TEXT,
+                     result TEXT CHECK (result IN ('delivered','failed')),
+                     created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                     cancelled_at REAL)"""
+            )
+            conn.execute(
+                "INSERT INTO subscriptions (id, target_url, secret, created_at) "
+                "VALUES ('sub-eeee0005', 'u', 'k', 1.0)"
+            )
+            conn.execute(
+                "INSERT INTO events (id, payload, created_at) VALUES ('e', '{}', 1.0)"
+            )
+            for _ in range(2):  # duplicate (event_id, subscription_id) pair
+                conn.execute(
+                    "INSERT INTO tasks (event_id, subscription_id, status, "
+                    "attempts, max_attempts, created_at, updated_at) VALUES "
+                    "('e', 'sub-eeee0005', 'pending', 0, 4, 1.0, 1.0)"
+                )
+            conn.execute("PRAGMA user_version=0")
+        finally:
+            conn.close()
+
+        with self.assertRaises(MigrationError) as ctx:
+            Database(self.path)
+        self.assertIn("version 7", str(ctx.exception))
+
+        # The failed step left no trace: user_version stopped at the last
+        # whole version, the original table (old CHECK, both duplicate rows)
+        # is untouched, and no rebuilt table leaked through.
+        check = _raw_connect(self.path)
+        try:
+            self.assertEqual(
+                check.execute("PRAGMA user_version").fetchone()[0], 6
+            )
+            self.assertEqual(
+                check.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 2
+            )
+            sql = check.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone()[0]
+            self.assertNotIn("'cancelled'", sql)
+            self.assertIsNone(
+                check.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='tasks_new'"
+                ).fetchone()
+            )
+        finally:
+            check.close()
+
+        # After the repair (drop the duplicate) the next start resumes the
+        # chain, reaches the latest version and serves cancels.
+        repair = _raw_connect(self.path)
+        try:
+            repair.execute("DELETE FROM tasks WHERE id = 2")
+        finally:
+            repair.close()
+        database = Database(self.path)
+        try:
+            self.assertEqual(
+                database._conn.execute("PRAGMA user_version").fetchone()[0],
+                LATEST_USER_VERSION,
+            )
+            result = database.cancel_event("e")
+            self.assertEqual(result["cancelled"], 1)
+            self.assertEqual(result["counts"]["cancelled"], 1)
+        finally:
+            database.close()
+
     # ------------------------------------------------------------------
     # step atomicity: failure rolls back, restart resumes
     # ------------------------------------------------------------------
@@ -589,6 +866,54 @@ class LifespanStartupTests(unittest.TestCase):
                 # Workers were started against the migrated database.
                 self.assertEqual(
                     client.app.state.db._conn.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    LATEST_USER_VERSION,
+                )
+
+    def test_drifted_database_serves_cancel_after_upgrade(self) -> None:
+        # The half-completed drift database (cancelled_at column present,
+        # status CHECK still rejecting 'cancelled'): the startup repair must
+        # make POST /events/{id}/cancel work and flip pending tasks to
+        # 'cancelled'; a repeated start stays idempotent.
+        _create_drifted_cancel_database(self.path)
+        client, main = self._client_with_db_path()
+        with patch.object(app_config, "DB_PATH", self.path), \
+             patch.object(main.config, "DB_PATH", self.path), \
+             patch.object(main.config, "WORKER_COUNT", 0):
+            with client:
+                resp = client.post("/events/evt-pending/cancel")
+                self.assertEqual(resp.status_code, 200)
+                body = resp.json()
+                self.assertEqual(body["cancelled"], 1)
+                self.assertEqual(body["counts"]["cancelled"], 1)
+                self.assertEqual(body["counts"]["pending"], 0)
+
+                status = client.get("/events/evt-pending")
+                self.assertEqual(status.status_code, 200)
+                body = status.json()
+                self.assertTrue(body["cancelled"])
+                self.assertEqual(body["counts"]["cancelled"], 1)
+                self.assertEqual(body["targets"][0]["status"], "cancelled")
+                self.assertIsNotNone(body["targets"][0]["cancelled_at"])
+
+                # Repeated cancellation is idempotent.
+                again = client.post("/events/evt-pending/cancel")
+                self.assertEqual(again.status_code, 200)
+                self.assertEqual(again.json()["cancelled"], 0)
+                self.assertEqual(again.json()["counts"]["cancelled"], 1)
+
+        # A restart against the repaired file keeps serving the same state.
+        client2, main2 = self._client_with_db_path()
+        with patch.object(app_config, "DB_PATH", self.path), \
+             patch.object(main2.config, "DB_PATH", self.path), \
+             patch.object(main2.config, "WORKER_COUNT", 0):
+            with client2:
+                status = client2.get("/events/evt-pending")
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["counts"]["cancelled"], 1)
+                self.assertEqual(
+                    client2.app.state.db._conn.execute(
                         "PRAGMA user_version"
                     ).fetchone()[0],
                     LATEST_USER_VERSION,

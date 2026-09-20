@@ -34,7 +34,7 @@ docker compose up --build
 ```
 
 一条命令完成镜像构建与启动：服务监听容器内 **8000** 端口，`docker-compose.yml` 通过 `"8000:8000"` 映射到宿主机同一端口，启动后访问 **http://localhost:8000**（交互式 API 文档：http://localhost:8000/docs，健康检查：http://localhost:8000/healthz）。
-SQLite 数据库保存在名为 `webhook-data` 的卷（容器内 `/data/webhook_relay.db`）中，容器重启后任务不丢失。老版本数据库在启动时按 `PRAGMA user_version` 版本链**自动迁移**：每个版本的结构变更与版本号推进在同一事务内提交，多实例同时启动时由数据库写锁串行（后到实例复查版本后跳过已完成步骤）；任一步骤失败整体回滚，修复数据库文件后再次启动即从断点继续升级；迁移结束执行外键完整性检查（`PRAGMA foreign_key_check`），不通过则拒绝启动、不启动任何工作器。
+SQLite 数据库保存在名为 `webhook-data` 的卷（容器内 `/data/webhook_relay.db`）中，容器重启后任务不丢失。老版本数据库在启动时按 `PRAGMA user_version` 版本链**自动迁移**：每个版本的结构变更与版本号推进在同一事务内提交，多实例同时启动时由数据库写锁串行（后到实例复查版本后跳过已完成步骤）；任一步骤失败整体回滚（版本号不推进），修复数据库文件后再次启动即从断点继续升级；迁移结束执行外键完整性检查（`PRAGMA foreign_key_check`），不通过则拒绝启动、不启动任何工作器。 拓宽 `tasks.status` 状态约束的 v7 步骤以**实际约束能力探测**为准而非仅凭列是否存在：对"已有 `cancelled_at` 列但 CHECK 仍不接受 `cancelled`"的半完成旧库会在同一事务内原子重建 `tasks` 表，完整保留任务数据、主键、自增序列、外键与索引，升级后 `POST /events/{id}/cancel` 即可正常使用。
 熔断阈值与冷却时间等配置均可在 `docker-compose.yml` 的 `environment` 中调整（见文末配置表）。
 
 `/ingest` 的密钥默认使用 compose 内置的开发值 `dev-ingest-secret-change-me`，生产环境请通过环境变量覆盖：
